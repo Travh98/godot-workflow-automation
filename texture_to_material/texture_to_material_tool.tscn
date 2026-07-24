@@ -1,0 +1,30 @@
+[gd_scene format=3 uid="uid://ddhhmjxib31v5"]
+
+[ext_resource type="Script" uid="uid://cgg4miucfefrl" path="res://game-assets/automation/texture_to_material_tool.gd" id="1_wg0vn"]
+[ext_resource type="Material" uid="uid://cj1rwjqekt71m" path="res://game-assets/materials/characters/mothman-body.tres" id="2_f4t5y"]
+[ext_resource type="Material" uid="uid://bpwt3aiy40nsw" path="res://game-assets/materials/characters/char-travhead.tres" id="2_n5l0v"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_wg0vn"]
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_n5l0v"]
+
+[sub_resource type="SphereMesh" id="SphereMesh_f4t5y"]
+
+[node name="TextureToMaterialTool" type="Node" unique_id=860129869]
+script = ExtResource("1_wg0vn")
+input_folder = "res://game-assets/textures/characters"
+output_folder = "res://game-assets/materials/characters"
+specular = 0.0
+
+[node name="TestMesh" type="MeshInstance3D" parent="." unique_id=685958868]
+mesh = SubResource("BoxMesh_wg0vn")
+
+[node name="TestMesh3" type="MeshInstance3D" parent="." unique_id=1600914886]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.27193952, 1.5617044)
+material_override = ExtResource("2_n5l0v")
+mesh = SubResource("PlaneMesh_n5l0v")
+
+[node name="TestMesh2" type="MeshInstance3D" parent="." unique_id=1519795151]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.0449784, 0, 0)
+material_override = ExtResource("2_f4t5y")
+mesh = SubResource("SphereMesh_f4t5y")
