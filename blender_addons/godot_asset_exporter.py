@@ -15,7 +15,7 @@ from bpy.props import StringProperty
 from bpy.types import Operator, Panel
 
 # res:// path to the post-import script stamped into every exported mesh's .import stub.
-MATERIAL_APPLIER_SCRIPT_PATH: str = "res://game-assets/godot-workflow-automation/material_applier_post_import.gd"
+MATERIAL_APPLIER_SCRIPT_PATH: str = "res://game-assets/godot-workflow-automation/material_applier_post_import/material_applier_post_import.gd"
 
 
 class GODOT_OT_ExportCollection(Operator):
@@ -392,7 +392,7 @@ class GODOT_PT_ExportPanel(Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Symlinked from repo:", icon='INFO')
-        box.label(text="game-assets/godot-workflow-automation/godot_asset_exporter.py")
+        box.label(text="game-assets/godot-workflow-automation/blender_addons/godot_asset_exporter.py")
 
 
 def menu_func_export(self, context) -> None:
