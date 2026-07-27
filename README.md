@@ -8,6 +8,20 @@ Back up your precious files before using any of these tools.
 - Godot holds the truth for Materials and Textures.
 - Blender holds the truth for Animations or Models.
 
+## Installing the Blender Addons
+
+`godot_asset_exporter.py` and `godot_material_sync.py` live in `blender_addons/`. Blender only loads addons from its own addons folder, so either install from disk (copies the file in) or symlink it there so edits to this repo are picked up immediately without reinstalling.
+
+Windows (PowerShell, run as Administrator or with Developer Mode enabled), one symlink per addon:
+```
+New-Item -ItemType SymbolicLink -Path "$env:APPDATA\Blender Foundation\Blender\<version>\scripts\addons\godot_asset_exporter.py" -Target "<path-to-this-repo>\blender_addons\godot_asset_exporter.py"
+New-Item -ItemType SymbolicLink -Path "$env:APPDATA\Blender Foundation\Blender\<version>\scripts\addons\godot_material_sync.py" -Target "<path-to-this-repo>\blender_addons\godot_material_sync.py"
+```
+
+Use a symlink, not a copy or a hard link — hard links break silently when an editor saves by writing a new file and renaming it over the old one, so Blender ends up loading stale code.
+
+Enable both addons in Blender's Preferences > Add-ons. With the symlink in place, editing a file in this repo and clicking that addon's "Reload Addon" button in the Add-ons list picks up the change immediately, instead of needing to reinstall it each time.
+
 ## Tools
 
 ### Batch Generate Godot Materials from a folder of Textures
