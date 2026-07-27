@@ -574,7 +574,7 @@ class GODOT_PT_MaterialSyncPanel(Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Symlinked from repo:", icon='INFO')
-        box.label(text="game-assets/automation/godot-material-sync.py")
+        box.label(text="game-assets/godot-workflow-automation/blender_addons/godot_material_sync.py")
 
 
 def register() -> None:

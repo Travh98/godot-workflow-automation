@@ -123,8 +123,21 @@ class GODOT_OT_ExportCollection(Operator):
         map_dir: str = os.path.join(export_root, collection.name)
         os.makedirs(map_dir, exist_ok=True)
         map_path: str = os.path.join(map_dir, "material_map.json")
+
+        # Merge onto the existing map so entries from a previous export pass
+        # that weren't touched this time (e.g. hidden objects with
+        # visible_only enabled) aren't dropped from the file.
+        existing_map: dict = {}
+        if os.path.exists(map_path):
+            with open(map_path, "r", encoding="utf-8") as f:
+                try:
+                    existing_map = json.load(f)
+                except json.JSONDecodeError:
+                    existing_map = {}
+        existing_map.update(material_map)
+
         with open(map_path, "w", encoding="utf-8") as f:
-            json.dump(material_map, f, indent=2, ensure_ascii=False)
+            json.dump(existing_map, f, indent=2, ensure_ascii=False)
 
         count: int = mesh_count_ref[0]
         self.report({'INFO'}, f"Exported {count} mesh(es) + material_map.json to {map_dir}")
