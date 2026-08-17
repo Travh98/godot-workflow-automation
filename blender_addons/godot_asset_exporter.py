@@ -203,52 +203,58 @@ class GODOT_OT_ExportCollection(Operator):
         import_path: str = glb_path + ".import"
         script_entry: str = f'import_script/path="{MATERIAL_APPLIER_SCRIPT_PATH}"'
 
+        if not os.path.exists(import_path):
+            # No .import file yet means Godot hasn't imported this .glb for real.
+            # A hand-written stub here would be missing the importer/uid/deps keys
+            # Godot's own import writes, so Godot treats it as invalid and silently
+            # regenerates a fresh .import with default settings on first import —
+            # discarding whatever we wrote. Project Settings > Import Defaults for
+            # the "scene" importer already stamps import_script/path onto every
+            # first-time import instead, so there's nothing to do here.
+            print(f"[GodotExporter] No .import file yet for {import_path} — relying on project import defaults")
+            return
+
         print(f"[GodotExporter] Writing import stub: {import_path}")
 
-        if os.path.exists(import_path):
-            with open(import_path, "r", encoding="utf-8") as f:
-                content: str = f.read()
+        with open(import_path, "r", encoding="utf-8") as f:
+            content: str = f.read()
 
-            content = content.replace("\r\n", "\n")
+        content = content.replace("\r\n", "\n")
 
-            # Replace line-by-line — handles empty value, wrong value, missing entry
-            lines: list = content.splitlines()
-            print(f"[GodotExporter] .import lines: {len(lines)}")
+        # Replace line-by-line — handles empty value, wrong value, missing entry
+        lines: list = content.splitlines()
+        print(f"[GodotExporter] .import lines: {len(lines)}")
 
-            new_lines: list = []
-            found_entry: bool = False
-            for ln in lines:
-                if ln.startswith("script_class="):
-                    continue  # strip old incorrect key
-                if ln.startswith("import_script/path="):
-                    print(f"[GodotExporter] Replacing: {ln!r}  ->  {script_entry!r}")
-                    new_lines.append(script_entry)
+        new_lines: list = []
+        found_entry: bool = False
+        for ln in lines:
+            if ln.startswith("script_class="):
+                continue  # strip old incorrect key
+            if ln.startswith("import_script/path="):
+                print(f"[GodotExporter] Replacing: {ln!r}  ->  {script_entry!r}")
+                new_lines.append(script_entry)
+                found_entry = True
+            else:
+                new_lines.append(ln)
+
+        if not found_entry:
+            print(f"[GodotExporter] import_script/path not found — inserting after [params]")
+            result: list = []
+            for ln in new_lines:
+                result.append(ln)
+                if ln.strip() == "[params]":
+                    result.append(script_entry)
                     found_entry = True
-                else:
-                    new_lines.append(ln)
+            new_lines = result
 
-            if not found_entry:
-                print(f"[GodotExporter] import_script/path not found — inserting after [params]")
-                result: list = []
-                for ln in new_lines:
-                    result.append(ln)
-                    if ln.strip() == "[params]":
-                        result.append(script_entry)
-                        found_entry = True
-                new_lines = result
+        if not found_entry:
+            print(f"[GodotExporter] No [params] section found — appending")
+            new_lines += ["", "[params]", script_entry]
 
-            if not found_entry:
-                print(f"[GodotExporter] No [params] section found — appending")
-                new_lines += ["", "[params]", script_entry]
-
-            content = "\n".join(new_lines) + "\n"
-            print(f"[GodotExporter] Writing updated .import")
-            with open(import_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        else:
-            print(f"[GodotExporter] No .import file yet — writing stub")
-            with open(import_path, "w", encoding="utf-8") as f:
-                f.write("[remap]\n\n[params]\n" + script_entry + "\n")
+        content = "\n".join(new_lines) + "\n"
+        print(f"[GodotExporter] Writing updated .import")
+        with open(import_path, "w", encoding="utf-8") as f:
+            f.write(content)
 
     def _collect_mesh_family(self, obj) -> list:
         """Return obj and all its mesh descendants (children, grandchildren, etc.).
