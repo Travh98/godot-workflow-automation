@@ -11,6 +11,9 @@ bl_info = {
 import bpy
 import os
 import json
+import sys
+import importlib
+import traceback
 from bpy.props import StringProperty
 from bpy.types import Operator, Panel
 
@@ -114,10 +117,11 @@ class GODOT_OT_ExportCollection(Operator):
         mesh_count_ref: list = [0]
 
         visible_only: bool = context.scene.godot_export_visible_only
+        depsgraph = context.evaluated_depsgraph_get()
 
         self._export_collection(
             context, collection, export_root, [collection.name], material_map, mesh_count_ref,
-            visible_only,
+            visible_only, depsgraph,
         )
 
         map_dir: str = os.path.join(export_root, collection.name)
@@ -152,6 +156,7 @@ class GODOT_OT_ExportCollection(Operator):
         material_map: dict,
         mesh_count_ref: list,
         visible_only: bool = False,
+        depsgraph=None,
     ) -> None:
         dir_path: str = os.path.join(export_root, *path_parts)
         os.makedirs(dir_path, exist_ok=True)
@@ -180,7 +185,7 @@ class GODOT_OT_ExportCollection(Operator):
             # material_applier_post_import.gd looks materials up by mesh name.
             family_meshes: list = family[1:] if obj.type == 'ARMATURE' else family
             material_map[rel_key] = {
-                mesh.name: [slot.material.name if slot.material else "" for slot in mesh.material_slots]
+                mesh.name: self._get_evaluated_materials(mesh, depsgraph)
                 for mesh in family_meshes
             }
 
@@ -197,7 +202,14 @@ class GODOT_OT_ExportCollection(Operator):
                 material_map,
                 mesh_count_ref,
                 visible_only,
+                depsgraph,
             )
+
+    def _get_evaluated_materials(self, mesh_obj, depsgraph) -> list:
+        # Reads the post-modifier mesh, so Geometry Nodes "Set Material" assignments
+        # are captured even when they aren't reflected in obj.material_slots.
+        obj_eval = mesh_obj.evaluated_get(depsgraph)
+        return [m.name if m else "" for m in obj_eval.data.materials]
 
     def _write_import_stub(self, glb_path: str) -> None:
         import_path: str = glb_path + ".import"
@@ -314,42 +326,52 @@ class GODOT_OT_ExportCollection(Operator):
             o.hide_set(was_hidden)
 
 
+def _do_reload(module_name: str) -> None:
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        print(f"[GodotExporter] Module {module_name!r} not in sys.modules")
+        return
+
+    try:
+        mod.unregister()
+    except Exception:
+        print("[GodotExporter] unregister() failed, continuing anyway:")
+        traceback.print_exc()
+
+    try:
+        importlib.reload(mod)
+    except Exception:
+        traceback.print_exc()
+        print("[GodotExporter] Reload failed, addon left unregistered")
+        return
+
+    try:
+        mod.register()
+    except Exception:
+        traceback.print_exc()
+        print("[GodotExporter] register() failed after reload")
+        return
+
+    print("[GodotExporter] Reloaded successfully.")
+
+
 class GODOT_OT_ReloadAddon(Operator):
     bl_idname = "godot.reload_addon"
     bl_label = "Reload Addon"
     bl_description = "Reload the Godot Asset Exporter addon from disk"
 
     def execute(self, context) -> set:
-        import sys
-        import importlib
-        import traceback
         module_name: str = __name__
         if module_name not in sys.modules:
             self.report({'ERROR'}, f"Module {module_name!r} not in sys.modules")
             return {'CANCELLED'}
-        mod = sys.modules[module_name]
 
-        try:
-            mod.unregister()
-        except Exception:
-            print("[GodotExporter] unregister() failed, continuing anyway:")
-            traceback.print_exc()
+        # Unregistering/re-registering this operator's own class while its
+        # execute() is still on Blender's call stack crashes Blender, so defer
+        # the actual reload to a timer that runs after this call returns.
+        bpy.app.timers.register(lambda: _do_reload(module_name), first_interval=0.0)
 
-        try:
-            importlib.reload(mod)
-        except Exception as e:
-            traceback.print_exc()
-            self.report({'ERROR'}, f"Reload failed, addon left unregistered: {e}")
-            return {'CANCELLED'}
-
-        try:
-            mod.register()
-        except Exception as e:
-            traceback.print_exc()
-            self.report({'ERROR'}, f"register() failed after reload: {e}")
-            return {'CANCELLED'}
-
-        self.report({'INFO'}, "Godot Asset Exporter reloaded.")
+        self.report({'INFO'}, "Godot Asset Exporter reload scheduled.")
         return {'FINISHED'}
 
 
