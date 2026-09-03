@@ -9,22 +9,21 @@ func _post_import(scene: Node) -> Object:
 	var source: String = get_source_file()
 	print("MaterialApplier: running on ", source)
 
-	var map_root: String = _find_map_root(source)
-	if map_root.is_empty():
-		print("MaterialApplier: no material_map.json found for ", source)
+	var matches: Array = _find_all_matching_maps(source)
+	if matches.is_empty():
+		print("MaterialApplier: no material_map.json entry found for ", source)
 		return scene
 
-	var map_file := FileAccess.open(ProjectSettings.globalize_path(map_root + "/material_map.json"), FileAccess.READ)
-	if map_file == null:
-		return scene
-	var material_map: Variant = JSON.parse_string(map_file.get_as_text())
-	if not material_map is Dictionary:
-		return scene
+	if matches.size() > 1:
+		var other_paths: Array = []
+		for i: int in range(1, matches.size()):
+			other_paths.append("%s (key '%s')" % [matches[i].map_path, matches[i].rel_key])
+		push_warning("MaterialApplier: '%s' matched in multiple material_map.json files — using '%s' (key '%s'), ignoring shadowed match(es): %s" % [
+			source.get_file(), matches[0].map_path, matches[0].rel_key, ", ".join(other_paths),
+		])
 
-	var rel_key: String = source.trim_prefix(map_root + "/").trim_suffix(".glb")
-	print("MaterialApplier: looking up key '", rel_key, "'")
-	var mat_data: Variant = (material_map as Dictionary).get(rel_key, [])
-	print("MaterialApplier: found for '", rel_key, "': ", mat_data)
+	var mat_data: Variant = matches[0].data
+	print("MaterialApplier: found for '", matches[0].rel_key, "' in ", matches[0].map_path, ": ", mat_data)
 	if mat_data is Array:
 		_apply_to_node(scene, mat_data as Array)
 	elif mat_data is Dictionary:
@@ -114,14 +113,32 @@ func _collect_material_matches(dir_path: String, mat_name: String, matches: Dict
 	dir.list_dir_end()
 
 
-func _find_map_root(glb_path: String) -> String:
+## Walks every directory from the glb's folder up to res://, opening any
+## material_map.json found along the way. A directory closer to the glb
+## isn't assumed to be the only source of truth — a stale map left behind
+## higher (or lower) in the tree can silently shadow the real one, so every
+## level is checked and reported. Returns matches ordered nearest-first;
+## the caller uses index 0 and warns about the rest.
+func _find_all_matching_maps(glb_path: String) -> Array:
+	var matches: Array = []
 	var dir: String = glb_path.get_base_dir()
-	while dir.length() > "res://".length():
-		var f := FileAccess.open(ProjectSettings.globalize_path(dir + "/material_map.json"), FileAccess.READ)
+	while dir.length() >= "res://".length():
+		var map_path: String = dir + "/material_map.json"
+		var f := FileAccess.open(ProjectSettings.globalize_path(map_path), FileAccess.READ)
 		if f != null:
-			return dir
+			var material_map: Variant = JSON.parse_string(f.get_as_text())
+			if material_map is Dictionary:
+				var rel_key: String = glb_path.trim_prefix(dir + "/").trim_suffix(".glb")
+				if (material_map as Dictionary).has(rel_key):
+					matches.append({
+						"map_path": map_path,
+						"rel_key": rel_key,
+						"data": (material_map as Dictionary)[rel_key],
+					})
+		if dir == "res://":
+			break
 		var parent: String = dir.get_base_dir()
 		if parent == dir:
 			break
 		dir = parent
-	return ""
+	return matches

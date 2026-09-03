@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://ddhhmjxib31v5"]
 
-[ext_resource type="Script" uid="uid://cgg4miucfefrl" path="res://game-assets/automation/texture_to_material_tool.gd" id="1_wg0vn"]
+[ext_resource type="Script" uid="uid://cgg4miucfefrl" path="res://game-assets/godot-workflow-automation/texture_to_material/texture_to_material_tool.gd" id="1_wg0vn"]
 [ext_resource type="Material" uid="uid://cj1rwjqekt71m" path="res://game-assets/materials/characters/mothman-body.tres" id="2_f4t5y"]
 [ext_resource type="Material" uid="uid://bpwt3aiy40nsw" path="res://game-assets/materials/characters/char-travhead.tres" id="2_n5l0v"]
 
@@ -12,8 +12,8 @@
 
 [node name="TextureToMaterialTool" type="Node" unique_id=860129869]
 script = ExtResource("1_wg0vn")
-input_folder = "res://game-assets/textures/characters"
-output_folder = "res://game-assets/materials/characters"
+input_folder = "res://game-assets/textures/photoscans"
+output_folder = "res://game-assets/materials/photoscans"
 specular = 0.0
 
 [node name="TestMesh" type="MeshInstance3D" parent="." unique_id=685958868]
