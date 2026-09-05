@@ -281,9 +281,25 @@ class GODOT_OT_ExportCollection(Operator):
                 result.extend(self._collect_mesh_family(child))
         return result
 
+    def _is_rigify_rig(self, armature_obj) -> bool:
+        """Detect a Rigify-generated control rig (ORG-/MCH-/DEF- bone convention)."""
+        data = armature_obj.data
+        if data.get("rigify_generator_version") is not None:
+            return True
+        return any(bone.name.startswith("DEF-") for bone in data.bones)
+
     def _export_mesh_family(self, context, objects: list, file_path: str) -> None:
         prev_active = context.view_layer.objects.active
         prev_selected: list = list(context.selected_objects)
+
+        root = objects[0]
+        # Rigify rigs carry ~300 control/mechanism bones (ORG-, MCH-, tweak,
+        # IK targets, VIS_ widgets) alongside the DEF- bones that actually
+        # deform the mesh. Only the DEF- bones matter in Godot, so drop the
+        # rest via the gltf exporter's own deform-only filter — it also
+        # reparents remaining bones to their nearest deform ancestor so the
+        # exported hierarchy stays valid.
+        export_def_bones: bool = root.type == 'ARMATURE' and self._is_rigify_rig(root)
 
         # Hidden objects can't be selected — unhide them so they actually
         # make it into the export, then restore hidden state afterward.
@@ -314,6 +330,7 @@ class GODOT_OT_ExportCollection(Operator):
             # NLA_TRACKS scopes export to only the tracks pushed down onto
             # this specific armature.
             export_animation_mode='NLA_TRACKS',
+            export_def_bones=export_def_bones,
         )
 
         for o in objects:
