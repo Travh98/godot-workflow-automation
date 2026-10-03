@@ -37,4 +37,6 @@ You build models in Blender. You apply materials to the blender models, and the 
 
 Select the Blender collection you want to export and select the output models folder. Press export and the meshes will be exported as individual .glb files, and a material_map.json will hold the data for what material each mesh uses.
 
+Plain Empty objects (not image references) export as their own `.glb` containing a single named `Node3D`, or ride along inside their parent mesh's `.glb`, so markers like `weapon-m4-primary-hand` can be instanced in Godot.
+
 As the .glb files get imported into Godot, their import script `material_applier_post_import.gd` will find the materials in material_map.json and apply them to the model.

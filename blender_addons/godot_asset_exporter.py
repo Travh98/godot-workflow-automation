@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Godot  |  File > Export > Godot Assets (.glb)",
-    "description": "Export the active collection's meshes as individual GLBs with a material map",
+    "description": "Export the active collection's meshes and empty markers as individual GLBs with a material map",
     "category": "Import-Export",
 }
 
@@ -165,12 +165,15 @@ class GODOT_OT_ExportCollection(Operator):
         rel_prefix: str = "/".join(path_parts[1:])
 
         for obj in collection.objects:
-            if obj.type not in ('MESH', 'ARMATURE'):
+            if obj.type not in ('MESH', 'ARMATURE') and not self._is_marker_empty(obj):
                 continue
             if visible_only and not obj.visible_get():
                 continue
-            # Skip meshes that export together with a parent mesh or rig
-            if obj.type == 'MESH' and obj.parent is not None and obj.parent.type in ('MESH', 'ARMATURE'):
+            # Skip meshes and markers that export together with a parent mesh or rig
+            if obj.type in ('MESH', 'EMPTY') and obj.parent is not None and obj.parent.type in ('MESH', 'ARMATURE'):
+                continue
+            # Skip markers that export together with a parent marker
+            if obj.type == 'EMPTY' and obj.parent is not None and self._is_marker_empty(obj.parent):
                 continue
 
             file_path: str = os.path.join(dir_path, obj.name + ".glb")
@@ -183,11 +186,12 @@ class GODOT_OT_ExportCollection(Operator):
             # list by name — a mesh with child meshes bundled into the same
             # .glb needs its own entry too, not just the root's slots, since
             # material_applier_post_import.gd looks materials up by mesh name.
-            family_meshes: list = family[1:] if obj.type == 'ARMATURE' else family
-            material_map[rel_key] = {
-                mesh.name: self._get_evaluated_materials(mesh, depsgraph)
-                for mesh in family_meshes
-            }
+            family_meshes: list = [o for o in family if o.type == 'MESH']
+            if family_meshes:
+                material_map[rel_key] = {
+                    mesh.name: self._get_evaluated_materials(mesh, depsgraph)
+                    for mesh in family_meshes
+                }
 
             self._export_mesh_family(context, family, file_path)
             self._write_import_stub(file_path)
@@ -268,16 +272,22 @@ class GODOT_OT_ExportCollection(Operator):
         with open(import_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    def _collect_mesh_family(self, obj) -> list:
-        """Return obj and all its mesh descendants (children, grandchildren, etc.).
+    def _is_marker_empty(self, obj) -> bool:
+        """Plain empties export as Node3D markers; image reference empties don't."""
+        return obj.type == 'EMPTY' and obj.empty_display_type != 'IMAGE'
 
-        Works for a MESH or an ARMATURE root — meshes skinned to a rig are
+    def _collect_mesh_family(self, obj) -> list:
+        """Return obj and all its mesh/marker descendants (children, grandchildren, etc.).
+
+        Works for a MESH, ARMATURE or EMPTY root — meshes skinned to a rig are
         parented to the armature, so this also collects an armature's
-        deform meshes.
+        deform meshes. Empty roots only bundle empty children.
         """
         result: list = [obj]
         for child in obj.children:
-            if child.type == 'MESH':
+            if child.type == 'MESH' and obj.type != 'EMPTY':
+                result.extend(self._collect_mesh_family(child))
+            elif self._is_marker_empty(child):
                 result.extend(self._collect_mesh_family(child))
         return result
 
@@ -404,6 +414,7 @@ def _draw_help_popup(self, context) -> None:
     layout.label(text="   plus a material_map.json and a Godot .import stub.")
     layout.label(text="   Every mesh in the family — root and children alike —")
     layout.label(text="   is keyed by name in material_map.json.")
+    layout.label(text="   Plain Empties export as .glb Node3D markers named after the empty.")
     layout.label(text="5. After editing this addon's script, click 'Reload Addon'.")
     layout.label(text="")
     layout.label(text="If a folder matching the active collection's name already exists")
