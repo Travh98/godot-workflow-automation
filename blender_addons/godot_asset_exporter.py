@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Godot Asset Exporter",
     "author": "Travh98",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Godot  |  File > Export > Godot Assets (.glb)",
     "description": "Export the active collection's meshes and empty markers as individual GLBs with a material map",
@@ -13,6 +13,7 @@ import os
 import json
 import sys
 import importlib
+import shutil
 import traceback
 from bpy.props import StringProperty
 from bpy.types import Operator, Panel
@@ -353,52 +354,88 @@ class GODOT_OT_ExportCollection(Operator):
             o.hide_set(was_hidden)
 
 
-def _do_reload(module_name: str) -> None:
-    mod = sys.modules.get(module_name)
-    if mod is None:
-        print(f"[GodotExporter] Module {module_name!r} not in sys.modules")
-        return
+def _resolve_dev_source(scene) -> str:
+    """Path of the repo copy of this script to sync from: the Dev Source File if set, else
+    <Godot project>/game-assets/godot-workflow-automation/blender_addons/ (project found by
+    searching upward from the Assets Folder for project.godot). Empty string if neither exists."""
+    explicit: str = bpy.path.abspath(scene.godot_exporter_dev_source.strip())
+    if explicit:
+        return explicit
+    export_path: str = bpy.path.abspath(scene.godot_export_path.strip())
+    if export_path:
+        current: str = os.path.abspath(export_path)
+        while True:
+            if os.path.isfile(os.path.join(current, "project.godot")):
+                guess: str = os.path.join(current, "game-assets", "godot-workflow-automation",
+                                          "blender_addons", "godot_asset_exporter.py")
+                return guess if os.path.isfile(guess) else ""
+            parent: str = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    return ""
 
+
+def _reload_addon(source_file: str) -> str:
+    """Copy source_file over the installed script (if different), unregister, drop the
+    cached module and register the fresh code. The source is checked BEFORE unregister so
+    a bad path leaves the working addon in place."""
+    module_name: str = __name__
+    installed: str = os.path.abspath(__file__)
+    copied: bool = False
+    if source_file:
+        if not os.path.isfile(source_file):
+            raise FileNotFoundError(f"Dev Source File not found: {source_file}")
+        if os.path.realpath(source_file) != os.path.realpath(installed):
+            shutil.copyfile(source_file, installed)  # copyfile (not copy2) so the .pyc is invalidated
+            copied = True
+    sys.modules[module_name].unregister()
+    del sys.modules[module_name]
+    importlib.invalidate_caches()
+    fresh = importlib.import_module(module_name)
+    fresh.register()
+    version: str = ".".join(str(v) for v in fresh.bl_info["version"])
+    return f"Reloaded Godot Asset Exporter v{version} ({'copied from source' if copied else 'no file copied'})"
+
+
+def _reload_later(source_file: str):
+    """Timer callback: reloads once the operator has returned, so no class is replaced mid-run."""
     try:
-        mod.unregister()
-    except Exception:
-        print("[GodotExporter] unregister() failed, continuing anyway:")
+        message: str = _reload_addon(source_file)
+    except Exception as e:
         traceback.print_exc()
-
+        message = f"Reload failed: {e}"
+    if not source_file and not message.startswith("Reload failed"):
+        message += " - Dev Source File is empty, so no new code was copied"
+    print("[GodotExporter]", message)
     try:
-        importlib.reload(mod)
+        bpy.context.window_manager.popup_menu(lambda menu, _context: menu.label(text=message), title="Godot Asset Exporter", icon='INFO')
     except Exception:
-        traceback.print_exc()
-        print("[GodotExporter] Reload failed, addon left unregistered")
-        return
-
+        pass
     try:
-        mod.register()
+        bpy.context.workspace.status_text_set(message)
+        bpy.app.timers.register(lambda: bpy.context.workspace.status_text_set(None), first_interval=10.0)
     except Exception:
-        traceback.print_exc()
-        print("[GodotExporter] register() failed after reload")
-        return
-
-    print("[GodotExporter] Reloaded successfully.")
+        pass
+    return None
 
 
 class GODOT_OT_ReloadAddon(Operator):
     bl_idname = "godot.reload_addon"
     bl_label = "Reload Addon"
-    bl_description = "Reload the Godot Asset Exporter addon from disk"
+    bl_description = ("Re-import the addon code in place, first copying the Dev Source File over the installed copy. "
+                      "If Dev Source File is empty, falls back to this Godot project's "
+                      "game-assets/godot-workflow-automation/blender_addons/godot_asset_exporter.py")
 
     def execute(self, context) -> set:
-        module_name: str = __name__
-        if module_name not in sys.modules:
-            self.report({'ERROR'}, f"Module {module_name!r} not in sys.modules")
-            return {'CANCELLED'}
-
-        # Unregistering/re-registering this operator's own class while its
-        # execute() is still on Blender's call stack crashes Blender, so defer
-        # the actual reload to a timer that runs after this call returns.
-        bpy.app.timers.register(lambda: _do_reload(module_name), first_interval=0.0)
-
-        self.report({'INFO'}, "Godot Asset Exporter reload scheduled.")
+        source: str = _resolve_dev_source(context.scene)
+        # Unregistering/re-registering this operator's own class while its execute() is
+        # still on Blender's call stack crashes Blender, so the reload runs from a timer.
+        bpy.app.timers.register(lambda: _reload_later(source), first_interval=0.1)
+        if source:
+            self.report({'INFO'}, f"Reloading addon from {source} ...")
+        else:
+            self.report({'WARNING'}, "No Dev Source File found: only re-importing the installed file, no new code is copied")
         return {'FINISHED'}
 
 
@@ -415,7 +452,8 @@ def _draw_help_popup(self, context) -> None:
     layout.label(text="   Every mesh in the family — root and children alike —")
     layout.label(text="   is keyed by name in material_map.json.")
     layout.label(text="   Plain Empties export as .glb Node3D markers named after the empty.")
-    layout.label(text="5. After editing this addon's script, click 'Reload Addon'.")
+    layout.label(text="5. After editing this addon's script, click 'Reload Addon'. It copies the repo script")
+    layout.label(text="   (Dev Source File, or the project's game-assets/godot-workflow-automation copy) over the installed one.")
     layout.label(text="")
     layout.label(text="If a folder matching the active collection's name already exists")
     layout.label(text="elsewhere in the project, a confirmation dialog warns you before export.")
@@ -432,7 +470,7 @@ class GODOT_OT_ShowHelp(Operator):
 
 
 class GODOT_PT_ExportPanel(Panel):
-    bl_label = "Godot Asset Exporter"
+    bl_label = "Godot Asset Exporter v" + ".".join(str(v) for v in bl_info["version"])
     bl_idname = "GODOT_PT_export_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -444,6 +482,7 @@ class GODOT_PT_ExportPanel(Panel):
 
         layout.prop(scene, "godot_export_path", text="Assets Folder")
         layout.prop(scene, "godot_export_visible_only", text="Visible Only")
+        layout.prop(scene, "godot_exporter_dev_source", text="Dev Source File")
 
         layout.separator(type='LINE')
 
@@ -457,11 +496,6 @@ class GODOT_PT_ExportPanel(Panel):
         layout.separator()
         layout.operator(GODOT_OT_ShowHelp.bl_idname, text="Help", icon='QUESTION')
         layout.operator(GODOT_OT_ReloadAddon.bl_idname, text="Reload Addon", icon='FILE_REFRESH')
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="Symlinked from repo:", icon='INFO')
-        box.label(text="game-assets/godot-workflow-automation/blender_addons/godot_asset_exporter.py")
 
 
 def menu_func_export(self, context) -> None:
@@ -480,6 +514,14 @@ def register() -> None:
         default="",
         subtype='DIR_PATH',
     )
+    bpy.types.Scene.godot_exporter_dev_source = StringProperty(
+        name="Dev Source File",
+        description=("Optional: the repo copy of godot_asset_exporter.py to copy over the installed addon on Reload. "
+                     "If empty, uses game-assets/godot-workflow-automation/blender_addons/godot_asset_exporter.py "
+                     "in the Godot project that contains the Assets Folder"),
+        default="",
+        subtype='FILE_PATH',
+    )
     bpy.utils.register_class(GODOT_OT_ExportCollection)
     bpy.utils.register_class(GODOT_OT_ReloadAddon)
     bpy.utils.register_class(GODOT_OT_ShowHelp)
@@ -493,6 +535,7 @@ def unregister() -> None:
     bpy.utils.unregister_class(GODOT_OT_ShowHelp)
     bpy.utils.unregister_class(GODOT_OT_ReloadAddon)
     bpy.utils.unregister_class(GODOT_OT_ExportCollection)
+    del bpy.types.Scene.godot_exporter_dev_source
     del bpy.types.Scene.godot_export_path
     del bpy.types.Scene.godot_export_visible_only
 
