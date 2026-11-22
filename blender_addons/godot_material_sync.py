@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Godot Material Sync",
     "author": "Travh98",
-    "version": (1, 0, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Godot",
     "description": "Sync Godot .tres materials from res://assets/materials and res://game-assets/materials into Blender",
@@ -10,12 +10,33 @@ bl_info = {
 
 import bpy
 import datetime
+import importlib
 import os
 import re
+import shutil
+import sys
+import uuid
 from bpy.props import StringProperty
 from bpy.types import Operator, Panel
 
 MATERIAL_SEARCH_DIRS = ("assets/materials", "game-assets/materials")
+
+# Synced materials are marked as assets and filed under this parent Asset Browser catalog
+# (keeps them separate from other materials loaded in Blender). Each material's subfolder
+# under the Godot materials dir becomes a nested catalog beneath it.
+CATALOG_ROOT = "GodotMaterialSync"
+_NULL_CATALOG_ID = "00000000-0000-0000-0000-000000000000"
+_CATS_FILENAME = "blender_assets.cats.txt"
+_CATS_HEADER = (
+    "# This is an Asset Catalog Definition file for Blender.\n"
+    "#\n"
+    "# Empty lines and lines starting with `#` will be ignored.\n"
+    "# The first non-ignored line should be the version indicator.\n"
+    "# Other lines are of the format \"UUID:catalog/path/for/assets:simple catalog name\"\n"
+    "\n"
+    "VERSION 1\n"
+    "\n"
+)
 
 # Godot's resource saver omits any StandardMaterial3D property left at its class
 # default, so a missing key means "use this value" — not "leave Blender alone".
@@ -381,6 +402,78 @@ def _apply_material(mat, parsed: dict, project_root: str) -> list:
     return warnings
 
 
+def _category_for(tres_path: str, search_dir: str) -> str:
+    """Catalog path for a .tres: its subfolder(s) under the materials dir, nested under
+    CATALOG_ROOT, e.g. materials/wood/oak/x.tres -> 'GodotMaterialSync/wood/oak'.
+    Files at the root of the materials dir go directly in CATALOG_ROOT."""
+    rel_dir = os.path.relpath(os.path.dirname(tres_path), search_dir)
+    parts = [p for p in re.split(r'[\\/]+', rel_dir) if p and p != '.']
+    return "/".join([CATALOG_ROOT] + parts)
+
+
+def _catalog_uuid(catalog_path: str) -> str:
+    # Deterministic so re-syncing (or syncing on another machine) yields the same catalog.
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "godot_material_sync/" + catalog_path))
+
+
+def _ensure_catalogs(catalog_paths: set) -> dict:
+    """Make sure blender_assets.cats.txt (next to the .blend) lists every catalog plus its
+    parents, keeping existing entries. Returns {catalog_path: uuid}, or {} if the .blend
+    hasn't been saved yet (there's nowhere to put the file)."""
+    if not bpy.data.filepath:
+        return {}
+    cats_path = os.path.join(os.path.dirname(bpy.data.filepath), _CATS_FILENAME)
+
+    text = ""
+    existing: dict = {}  # path -> uuid
+    if os.path.isfile(cats_path):
+        with open(cats_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('VERSION'):
+                continue
+            parts = line.split(':', 2)
+            if len(parts) >= 2:
+                existing[parts[1]] = parts[0]
+    else:
+        text = _CATS_HEADER
+
+    result: dict = {}
+    added: list = []
+    for path in sorted(catalog_paths):
+        pieces = path.split('/')
+        for i in range(1, len(pieces) + 1):
+            sub = "/".join(pieces[:i])
+            if sub not in existing:
+                existing[sub] = _catalog_uuid(sub)
+                added.append(f"{existing[sub]}:{sub}:{sub.replace('/', '-')}\n")
+        result[path] = existing[path]
+
+    if added:
+        if text and not text.endswith('\n'):
+            text += '\n'
+        with open(cats_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(text + "".join(added))
+        print(f"[MaterialSync] Added {len(added)} asset catalog(s) to {cats_path}")
+    return result
+
+
+def _mark_material_as_asset(mat, catalog_id) -> bool:
+    """Mark a material as an asset and file it under its catalog. The Godot folder is the
+    source of truth, so the catalog is re-applied on every sync. Returns True if newly marked."""
+    newly_marked = mat.asset_data is None
+    if newly_marked:
+        mat.asset_mark()
+        try:
+            mat.asset_generate_preview()
+        except Exception:
+            pass  # previews can't be generated in some contexts (e.g. background mode)
+    if catalog_id and mat.asset_data is not None:
+        mat.asset_data.catalog_id = catalog_id
+    return newly_marked
+
+
 class GODOT_OT_SyncMaterials(Operator):
     bl_idname = "godot.sync_materials"
     bl_label = "Sync Materials"
@@ -398,7 +491,7 @@ class GODOT_OT_SyncMaterials(Operator):
             self.report({'ERROR'}, f"Godot project folder does not exist: {project_root}")
             return {'CANCELLED'}
 
-        tres_paths: list = []
+        tres_paths: list = []  # (path, search_dir)
         skipped_unsupported: int = 0
         for rel_dir in MATERIAL_SEARCH_DIRS:
             search_dir = os.path.join(project_root, rel_dir)
@@ -407,7 +500,7 @@ class GODOT_OT_SyncMaterials(Operator):
             for root, _dirs, files in os.walk(search_dir):
                 for fname in files:
                     if fname.endswith('.tres'):
-                        tres_paths.append(os.path.join(root, fname))
+                        tres_paths.append((os.path.join(root, fname), search_dir))
                     elif fname.endswith('.material') or fname.endswith('.res'):
                         skipped_unsupported += 1
 
@@ -417,9 +510,20 @@ class GODOT_OT_SyncMaterials(Operator):
 
         created_count: int = 0
         updated_count: int = 0
+        newly_marked_count: int = 0
         all_warnings: list = []
 
-        for tres_path in tres_paths:
+        categories: dict = {tp: _category_for(tp, sd) for tp, sd in tres_paths}
+        try:
+            catalog_ids: dict = _ensure_catalogs(set(categories.values()))
+        except OSError as e:
+            catalog_ids = {}
+            all_warnings.append(f"could not write {_CATS_FILENAME} ({e}) — assets left uncategorised")
+        if not catalog_ids and not bpy.data.filepath:
+            all_warnings.append(
+                f"save the .blend first so the '{CATALOG_ROOT}' catalogs can be created — materials were marked as assets but left uncategorised")
+
+        for tres_path, _search_dir in tres_paths:
             mat_name: str = os.path.splitext(os.path.basename(tres_path))[0]
 
             mtime = os.path.getmtime(tres_path)
@@ -444,6 +548,9 @@ class GODOT_OT_SyncMaterials(Operator):
             warnings = _apply_material(mat, parsed, project_root)
             all_warnings.extend(f"{mat_name}: {w}" for w in warnings)
 
+            if _mark_material_as_asset(mat, catalog_ids.get(categories[tres_path])):
+                newly_marked_count += 1
+
             if existing:
                 updated_count += 1
             else:
@@ -452,7 +559,14 @@ class GODOT_OT_SyncMaterials(Operator):
         for w in all_warnings:
             print(f"[MaterialSync] {w}")
 
+        if catalog_ids:
+            try:
+                bpy.ops.asset.library_refresh()  # make open Asset Browsers pick up the new catalog
+            except Exception:
+                pass
+
         msg: str = f"Synced materials: {created_count} created, {updated_count} updated"
+        msg += f", {newly_marked_count} newly marked as assets in '{CATALOG_ROOT}'"
         if skipped_unsupported:
             msg += f", {skipped_unsupported} skipped (.material/.res unsupported)"
         if all_warnings:
@@ -488,42 +602,80 @@ class GODOT_OT_CleanupUnusedMaterials(Operator):
         return {'FINISHED'}
 
 
+def _version_string() -> str:
+    return ".".join(str(v) for v in bl_info["version"])
+
+
+def _resolve_dev_source(scene) -> str:
+    """Path of the repo copy of this script to sync from: the Dev Source File if set,
+    else the one inside the Godot Project Folder. Empty string if neither exists."""
+    explicit = bpy.path.abspath(scene.godot_material_dev_source.strip())
+    if explicit:
+        return explicit
+    root = bpy.path.abspath(scene.godot_material_project_path.strip())
+    if root:
+        guess = os.path.join(root, "game-assets", "godot-workflow-automation", "blender_addons", "godot_material_sync.py")
+        if os.path.isfile(guess):
+            return guess
+    return ""
+
+
+def _reload_addon(source_file: str) -> str:
+    """Copy source_file over the installed script (if different), unregister, drop the
+    cached module and register the fresh code. Source is checked BEFORE unregister so a
+    bad path leaves the working addon in place."""
+    module_name: str = __name__
+    installed = os.path.abspath(__file__)
+    copied = False
+    if source_file:
+        if not os.path.isfile(source_file):
+            raise FileNotFoundError(f"Dev Source File not found: {source_file}")
+        if os.path.realpath(source_file) != os.path.realpath(installed):
+            shutil.copyfile(source_file, installed)  # copyfile (not copy2) so the .pyc is invalidated
+            copied = True
+    sys.modules[module_name].unregister()
+    del sys.modules[module_name]
+    importlib.invalidate_caches()
+    fresh = importlib.import_module(module_name)
+    fresh.register()
+    version = ".".join(str(v) for v in fresh.bl_info["version"])
+    return f"Reloaded Godot Material Sync v{version} ({'copied from source' if copied else 'no file copied'})"
+
+
+def _reload_later(source_file: str):
+    """Timer callback: reloads once the operator has returned, so no class is replaced mid-run."""
+    try:
+        message = _reload_addon(source_file)
+    except Exception as e:
+        message = f"Reload failed: {e}"
+    if not source_file and not message.startswith("Reload failed"):
+        message += " - Dev Source File is empty, so no new code was copied"
+    print("[MaterialSync]", message)
+    try:
+        bpy.context.window_manager.popup_menu(lambda menu, _context: menu.label(text=message), title="Godot Material Sync", icon='INFO')
+    except Exception:
+        pass
+    try:
+        bpy.context.workspace.status_text_set(message)
+        bpy.app.timers.register(lambda: bpy.context.workspace.status_text_set(None), first_interval=10.0)
+    except Exception:
+        pass
+    return None
+
+
 class GODOT_OT_ReloadMaterialSyncAddon(Operator):
     bl_idname = "godot.reload_material_sync_addon"
     bl_label = "Reload Addon"
-    bl_description = "Reload the Godot Material Sync addon from disk"
+    bl_description = ("Re-import the addon code in place, first copying the Dev Source File over the installed "
+                      "copy. If Dev Source File is empty, falls back to <Project Folder>/game-assets/godot-workflow-automation/blender_addons/godot_material_sync.py")
 
     def execute(self, context) -> set:
-        import sys
-        import importlib
-        import traceback
-        module_name: str = __name__
-        if module_name not in sys.modules:
-            self.report({'ERROR'}, f"Module {module_name!r} not in sys.modules")
-            return {'CANCELLED'}
-        mod = sys.modules[module_name]
-
-        try:
-            mod.unregister()
-        except Exception:
-            print("[MaterialSync] unregister() failed, continuing anyway:")
-            traceback.print_exc()
-
-        try:
-            importlib.reload(mod)
-        except Exception as e:
-            traceback.print_exc()
-            self.report({'ERROR'}, f"Reload failed, addon left unregistered: {e}")
-            return {'CANCELLED'}
-
-        try:
-            mod.register()
-        except Exception as e:
-            traceback.print_exc()
-            self.report({'ERROR'}, f"register() failed after reload: {e}")
-            return {'CANCELLED'}
-
-        self.report({'INFO'}, "Godot Material Sync reloaded.")
+        source = _resolve_dev_source(context.scene)
+        bpy.app.timers.register(lambda: _reload_later(source), first_interval=0.1)
+        if source:
+            self.report({'INFO'}, f"Reloading addon from {source} ...")
+        else:
+            self.report({'WARNING'}, "No Dev Source File found: only re-importing the installed file, no new code is copied")
         return {'FINISHED'}
 
 
@@ -536,7 +688,9 @@ def _draw_help_popup(self, context) -> None:
     layout.label(text="1. Set 'Project Folder' to your Godot project's root (containing project.godot).")
     layout.label(text="2. Click 'Sync Materials'.")
     layout.label(text="3. Materials are matched by name and created/updated in place.")
-    layout.label(text="4. After editing this addon's script, click 'Reload Addon'.")
+    layout.label(text="   Each is marked as an asset in 'GodotMaterialSync/<subfolder>' (save the .blend first).")
+    layout.label(text="4. After editing this addon's script, click 'Reload Addon'. It copies the repo script")
+    layout.label(text="   (Dev Source File, or <Project Folder>/game-assets/godot-workflow-automation/) over the installed one.")
     layout.label(text="5. 'Cleanup to Only Used Materials' deletes any material not")
     layout.label(text="   assigned to a model's material slots (asks for confirmation).")
 
@@ -552,7 +706,7 @@ class GODOT_OT_ShowMaterialSyncHelp(Operator):
 
 
 class GODOT_PT_MaterialSyncPanel(Panel):
-    bl_label = "Godot Material Sync"
+    bl_label = "Godot Material Sync v" + ".".join(str(v) for v in bl_info["version"])
     bl_idname = "GODOT_PT_material_sync_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -563,6 +717,7 @@ class GODOT_PT_MaterialSyncPanel(Panel):
         scene = context.scene
 
         layout.prop(scene, "godot_material_project_path", text="Project Folder")
+        layout.prop(scene, "godot_material_dev_source", text="Dev Source File")
 
         layout.separator(type='LINE')
         layout.operator(GODOT_OT_SyncMaterials.bl_idname, text="Sync Materials", icon='MATERIAL')
@@ -571,11 +726,6 @@ class GODOT_PT_MaterialSyncPanel(Panel):
         layout.operator(GODOT_OT_ShowMaterialSyncHelp.bl_idname, text="Help", icon='QUESTION')
         layout.operator(GODOT_OT_ReloadMaterialSyncAddon.bl_idname, text="Reload Addon", icon='FILE_REFRESH')
 
-        layout.separator()
-        box = layout.box()
-        box.label(text="Symlinked from repo:", icon='INFO')
-        box.label(text="game-assets/godot-workflow-automation/blender_addons/godot_material_sync.py")
-
 
 def register() -> None:
     bpy.types.Scene.godot_material_project_path = StringProperty(
@@ -583,6 +733,13 @@ def register() -> None:
         description="Root path of the Godot project (containing project.godot)",
         default="",
         subtype='DIR_PATH',
+    )
+    bpy.types.Scene.godot_material_dev_source = StringProperty(
+        name="Dev Source File",
+        description=("Optional: the repo copy of godot_material_sync.py to copy over the installed addon on Reload. "
+                     "If empty, uses <Project Folder>/game-assets/godot-workflow-automation/blender_addons/godot_material_sync.py when it exists"),
+        default="",
+        subtype='FILE_PATH',
     )
     bpy.utils.register_class(GODOT_OT_SyncMaterials)
     bpy.utils.register_class(GODOT_OT_CleanupUnusedMaterials)
@@ -597,6 +754,7 @@ def unregister() -> None:
     bpy.utils.unregister_class(GODOT_OT_ReloadMaterialSyncAddon)
     bpy.utils.unregister_class(GODOT_OT_CleanupUnusedMaterials)
     bpy.utils.unregister_class(GODOT_OT_SyncMaterials)
+    del bpy.types.Scene.godot_material_dev_source
     del bpy.types.Scene.godot_material_project_path
 
 
