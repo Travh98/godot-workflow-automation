@@ -1,0 +1,7 @@
+[gd_scene format=3 uid="uid://bbr55sj80dbud"]
+
+[ext_resource type="Script" uid="uid://bpnorp1xg5df6" path="res://game-assets/godot-workflow-automation/texture_to_material/missing_materials_tool.gd" id="1_mmt"]
+
+[node name="MissingMaterialsTool" type="Node" unique_id=1479289338]
+script = ExtResource("1_mmt")
+blacklisted_folders = Array[String](["res://game-assets/materials/pixel/particles/", "res://game-assets/materials/pixel/particles/", "res://game-assets/materials/gwj98/", "res://game-assets/materials/gwj97/", "res://game-assets/materials/icons/", "res://game-assets/materials/vehicles/"])
