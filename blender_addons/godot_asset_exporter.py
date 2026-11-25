@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Godot Asset Exporter",
     "author": "Travh98",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Godot  |  File > Export > Godot Assets (.glb)",
     "description": "Export the active collection's meshes and empty markers as individual GLBs with a material map",
@@ -166,12 +166,12 @@ class GODOT_OT_ExportCollection(Operator):
         rel_prefix: str = "/".join(path_parts[1:])
 
         for obj in collection.objects:
-            if obj.type not in ('MESH', 'ARMATURE') and not self._is_marker_empty(obj):
+            if not self._is_mesh_like(obj) and obj.type != 'ARMATURE' and not self._is_marker_empty(obj):
                 continue
             if visible_only and not obj.visible_get():
                 continue
             # Skip meshes and markers that export together with a parent mesh or rig
-            if obj.type in ('MESH', 'EMPTY') and obj.parent is not None and obj.parent.type in ('MESH', 'ARMATURE'):
+            if (self._is_mesh_like(obj) or obj.type == 'EMPTY') and obj.parent is not None and (self._is_mesh_like(obj.parent) or obj.parent.type == 'ARMATURE'):
                 continue
             # Skip markers that export together with a parent marker
             if obj.type == 'EMPTY' and obj.parent is not None and self._is_marker_empty(obj.parent):
@@ -187,10 +187,10 @@ class GODOT_OT_ExportCollection(Operator):
             # list by name — a mesh with child meshes bundled into the same
             # .glb needs its own entry too, not just the root's slots, since
             # material_applier_post_import.gd looks materials up by mesh name.
-            family_meshes: list = [o for o in family if o.type == 'MESH']
+            family_meshes: list = [o for o in family if self._is_mesh_like(o)]
             if family_meshes:
                 material_map[rel_key] = {
-                    mesh.name: self._get_evaluated_materials(mesh, depsgraph)
+                    mesh.name: self._get_evaluated_materials(context, mesh, depsgraph)
                     for mesh in family_meshes
                 }
 
@@ -210,11 +210,26 @@ class GODOT_OT_ExportCollection(Operator):
                 depsgraph,
             )
 
-    def _get_evaluated_materials(self, mesh_obj, depsgraph) -> list:
+    def _get_evaluated_materials(self, context, mesh_obj, depsgraph) -> list:
         # Reads the post-modifier mesh, so Geometry Nodes "Set Material" assignments
         # are captured even when they aren't reflected in obj.material_slots.
         obj_eval = mesh_obj.evaluated_get(depsgraph)
-        return [m.name if m else "" for m in obj_eval.data.materials]
+        if mesh_obj.type != 'MESH':
+            mesh = self._realized_mesh_from_object(context, mesh_obj)
+        else:
+            mesh = obj_eval.data
+        try:
+            names: list = [m.name if m else "" for m in mesh.materials]
+            # Empty or unused slots (common after Geometry Nodes, e.g. an empty slot 0
+            # before the Set Material slot) get no surface in the .glb, and the Godot
+            # material applier matches by surface index, so list only the slots that
+            # faces actually use, in slot order.
+            used: list = sorted({p.material_index for p in mesh.polygons})
+            names = [names[i] if i < len(names) else "" for i in used]
+            return names
+        finally:
+            if mesh_obj.type != 'MESH':
+                bpy.data.meshes.remove(mesh)
 
     def _write_import_stub(self, glb_path: str) -> None:
         import_path: str = glb_path + ".import"
@@ -277,6 +292,46 @@ class GODOT_OT_ExportCollection(Operator):
         """Plain empties export as Node3D markers; image reference empties don't."""
         return obj.type == 'EMPTY' and obj.empty_display_type != 'IMAGE'
 
+    def _realized_mesh_from_object(self, context, obj):
+        """Return a new mesh datablock holding obj's evaluated geometry with instances realized.
+
+        Geometry Nodes output that is still instances (no Realize Instances node) would
+        convert to an empty mesh, so a temporary copy of the object gets one extra
+        realize-only modifier on top of its stack. The copy, the helper node group and
+        the modifier are removed again; the original object is not touched. The caller
+        owns the returned mesh and must remove it.
+        """
+        group = bpy.data.node_groups.new("__GodotExporterRealize", 'GeometryNodeTree')
+        group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+        group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+        n_in = group.nodes.new("NodeGroupInput")
+        n_real = group.nodes.new("GeometryNodeRealizeInstances")
+        n_out = group.nodes.new("NodeGroupOutput")
+        group.links.new(n_in.outputs[0], n_real.inputs["Geometry"])
+        group.links.new(n_real.outputs["Geometry"], n_out.inputs[0])
+
+        temp = obj.copy()
+        context.scene.collection.objects.link(temp)
+        try:
+            modifier = temp.modifiers.new("__realize", 'NODES')
+            modifier.node_group = group
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+            return bpy.data.meshes.new_from_object(temp.evaluated_get(depsgraph), depsgraph=depsgraph)
+        finally:
+            bpy.data.objects.remove(temp)
+            bpy.data.node_groups.remove(group)
+
+    def _is_mesh_like(self, obj) -> bool:
+        """A real mesh, or a curve/surface/text/metaball with a Geometry Nodes modifier.
+
+        Geometry Nodes can turn any of those into mesh geometry. They export as a mesh
+        via a temporary converted copy (see _export_mesh_family); the original is untouched.
+        """
+        if obj.type == 'MESH':
+            return True
+        return obj.type in ('CURVE', 'SURFACE', 'FONT', 'META') and any(m.type == 'NODES' for m in obj.modifiers)
+
     def _collect_mesh_family(self, obj) -> list:
         """Return obj and all its mesh/marker descendants (children, grandchildren, etc.).
 
@@ -286,7 +341,7 @@ class GODOT_OT_ExportCollection(Operator):
         """
         result: list = [obj]
         for child in obj.children:
-            if child.type == 'MESH' and obj.type != 'EMPTY':
+            if self._is_mesh_like(child) and obj.type != 'EMPTY':
                 result.extend(self._collect_mesh_family(child))
             elif self._is_marker_empty(child):
                 result.extend(self._collect_mesh_family(child))
@@ -318,6 +373,39 @@ class GODOT_OT_ExportCollection(Operator):
         for o in prev_hidden:
             o.hide_set(False)
 
+        # Geometry Nodes on a non-mesh object (e.g. a curve): export a temporary
+        # mesh copy that carries the original's name, transform, parent and materials.
+        # The original is renamed while the copy exists and restored afterwards, so
+        # the .blend ends up exactly as it was.
+        temp_swaps: list = []  # (original, original_name, temp_object)
+        reparented: list = []  # (child, original_parent)
+        export_objects: list = []
+        for o in objects:
+            if o.type == 'MESH' or o.type not in ('CURVE', 'SURFACE', 'FONT', 'META'):
+                export_objects.append(o)
+                continue
+            mesh = self._realized_mesh_from_object(context, o)
+            original_name: str = o.name
+            o.name = original_name + ".__orig"
+            mesh.name = original_name
+            temp = bpy.data.objects.new(original_name, mesh)
+            for c in o.users_collection:
+                c.objects.link(temp)
+            temp.parent = o.parent
+            temp.parent_type = o.parent_type
+            temp.parent_bone = o.parent_bone
+            temp.matrix_parent_inverse = o.matrix_parent_inverse.copy()
+            temp.matrix_basis = o.matrix_basis.copy()
+            # Bundled children follow the temp copy while exporting. Same world
+            # matrix as the original, so the existing parent-inverse stays valid.
+            for child in o.children:
+                if child in objects:
+                    reparented.append((child, o))
+                    child.parent = temp
+            temp_swaps.append((o, original_name, temp))
+            export_objects.append(temp)
+        objects = export_objects
+
         for o in context.selected_objects:
             o.select_set(False)
         for o in objects:
@@ -346,6 +434,13 @@ class GODOT_OT_ExportCollection(Operator):
 
         for o in objects:
             o.select_set(False)
+        for child, original_parent in reparented:
+            child.parent = original_parent
+        for original, original_name, temp in temp_swaps:
+            temp_mesh = temp.data
+            bpy.data.objects.remove(temp)
+            bpy.data.meshes.remove(temp_mesh)
+            original.name = original_name
         for o in prev_selected:
             o.select_set(True)
         context.view_layer.objects.active = prev_active
